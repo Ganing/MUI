@@ -114,6 +114,12 @@
 #pragma comment(lib, "libthorvg.lib")  
 
 #define ODD(...) wprintf(__VA_ARGS__)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_PI_2
+#define M_PI_2 (M_PI/2.0)
+#endif
 
 namespace fs = std::filesystem;
 
@@ -1325,9 +1331,9 @@ namespace MUI {
 
     class UIManager {
     private:
-        std::unique_ptr<tvg::GlCanvas> canvas;  // 只支持 GlCanvas  
-        tvg::Scene* scene = nullptr;
         void* glctx = nullptr;
+        std::unique_ptr<tvg::GlCanvas> canvas;  // 只支持 GlCanvas  
+        tvg::Scene* scene = nullptr;       
         std::vector<std::unique_ptr<UIElement>> elements;
 
         uint32_t width = 0;
@@ -1343,24 +1349,9 @@ namespace MUI {
 
         bool init(void* glContext, int w, int h);
         void update(float deltaTime);
-        void render();
+        void render();      
+        void resize(int w, int h);
         void clear();
-        void resize(int w, int h) {
-            width = w;
-            height = h;
-
-            // ✅ 同步 ThorVG 画布尺寸
-            if (canvas && glctx && w > 0 && h > 0) {
-                auto r = canvas->target(glctx, 0, (uint32_t)w, (uint32_t)h, tvg::ColorSpace::ABGR8888S);
-                if (r != tvg::Result::Success) {
-                    ODD(L"GlCanvas target 重设失败(resize): %d\n", (int)r);
-                }
-            }
-
-            for (auto& element : elements) {
-                element->onSize(w, h);
-            }
-        }
 
         void addElement(std::unique_ptr<UIElement> element);
         void removeElement(UIElement* element);
@@ -1436,8 +1427,25 @@ namespace MUI {
         }
 
         canvas->update();
-        canvas->draw(true);
+        canvas->draw(false);
         canvas->sync();
+    }
+
+    void UIManager::resize(int w, int h) {
+        width = w;
+        height = h;
+
+        // ✅ 同步 ThorVG 画布尺寸
+        if (canvas && glctx && w > 0 && h > 0) {
+            auto r = canvas->target(glctx, 0, (uint32_t)w, (uint32_t)h, tvg::ColorSpace::ABGR8888S);
+            if (r != tvg::Result::Success) {
+                ODD(L"GlCanvas target 重设失败(resize): %d\n", (int)r);
+            }
+        }
+
+        for (auto& element : elements) {
+            element->onSize(w, h);
+        }
     }
 
     void UIManager::clear() {
@@ -3179,7 +3187,7 @@ namespace MUI {
                     reinterpret_cast<const uint32_t*>(bitmap.data),
                     bitmap.width,
                     bitmap.height,
-                    tvg::ColorSpace::ABGR8888,
+                    tvg::ColorSpace::ABGR8888S,
                     false
                 );
 
@@ -3475,7 +3483,7 @@ namespace MUI {
                     reinterpret_cast<const uint32_t*>(currentBitmap.data),
                     currentBitmap.width,
                     currentBitmap.height,
-                    tvg::ColorSpace::ABGR8888,
+                    tvg::ColorSpace::ABGR8888S,
                     false  // 不复制,直接使用缓存数据  
                 );
 
