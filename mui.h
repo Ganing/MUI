@@ -281,6 +281,7 @@ namespace MUI {
         return bitmap;
     }
 
+
     // 释放 OBitmap 资源  
     void freeBitmap(OBitmap& bitmap) {
         if (bitmap.data) {
@@ -1991,13 +1992,27 @@ namespace MUI {
     }
 
     bool Application::createWindow(const wchar_t* title) {
+        HICON       hIconBig = nullptr;
+        HICON       hIconSmall = nullptr;
+        // 获取进程 HINSTANCE（模块句柄）
+        HINSTANCE hInst = GetModuleHandleW(nullptr);
+        // 从资源加载图标（使用 LR_SHARED，系统负责释放）
+        hIconBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR | LR_SHARED);
+        hIconSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCE(IDI_SMALL_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR | LR_SHARED);
+
+
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(WNDCLASSEXW);
         wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
         wc.lpfnWndProc = StaticWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hInstance = hInst;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.lpszClassName = L"MUIWindowClass";
+
+        // 把资源图标赋给窗口类；若加载失败回退到系统默认图标
+        wc.hIcon = hIconBig ? hIconBig : LoadIcon(nullptr, IDI_APPLICATION);
+        wc.hIconSm = hIconSmall ? hIconSmall : LoadIcon(nullptr, IDI_APPLICATION);
+
 
         if (!RegisterClassExW(&wc)) {
             ODD(L"窗口类注册失败\n");
@@ -2032,6 +2047,11 @@ namespace MUI {
             ODD(L"窗口创建失败\n");
             return false;
         }
+
+        // 有些平台/主题需要显式设置一次 ICON，确保任务栏/窗口标题都使用资源图标
+        if (hIconBig) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
+        if (hIconSmall) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSmall);
+
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
@@ -2124,17 +2144,6 @@ namespace MUI {
                 instance->uiManager->handleSize(w, h);
             }
 
-            // 如果你更偏好在 Application 层直接重设 GlCanvas target（可选），
-    // 可启用下面几行，但请避免与 handleSize 重复调用：
-    /*
-    if (instance->uiManager) {
-        if (auto canvas = instance->uiManager->getCanvas()) {
-            // 注意：target 的第一个参数是 GL 上下文指针；这里传 hglrc
-            canvas->target(instance->hglrc, 0, (uint32_t)w, (uint32_t)h, tvg::ColorSpace::ABGR8888S);
-        }
-    }
-    */
-
             return 0;
         }
 
@@ -2191,7 +2200,244 @@ namespace MUI {
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 
-} // namespace MUI  
+} // namespace MUI
+
+// UIFrame 控件 
+namespace MUI {
+
+    class UIFrame : public UIElement {
+    private:
+        // 子元素列表  
+        std::vector<std::unique_ptr<UIElement>> children;
+
+        // 布局属性  
+        struct {
+            float top = 0, right = 0, bottom = 0, left = 0;
+        } padding;
+
+        float gap = 0.0f;  // 子元素间距  
+
+        enum class Direction { Horizontal, Vertical } direction = Direction::Vertical;
+        enum class Alignment { Start, Center, End, Stretch } alignment = Alignment::Start;
+
+        // 视觉样式  
+        Color fillColor = Color(255, 255, 255, 255);
+        bool enableFill = true;
+        Color strokeColor = Color(200, 200, 200, 255);
+        float strokeWidth = 1.0f;
+        bool enableStroke = false;
+        float cornerRadius = 0.0f;
+        float opacity = 1.0f;
+
+        // 裁剪和滚动  
+        bool clipsContent = false;
+        float scrollOffsetX = 0.0f;
+        float scrollOffsetY = 0.0f;
+
+    public:
+        UIFrame() {
+            rect = { 0, 0, 100, 100 };
+        }
+
+        ~UIFrame() noexcept override {
+            children.clear();
+        }
+
+        // 添加子元素  
+        void addChild(std::unique_ptr<UIElement> child) {
+            children.push_back(std::move(child));
+            updateLayout();
+        }
+
+        // 移除子元素  
+        void removeChild(UIElement* child) {
+            children.erase(
+                std::remove_if(children.begin(), children.end(),
+                    [child](const auto& c) { return c.get() == child; }),
+                children.end()
+            );
+            updateLayout();
+        }
+
+        // 设置布局方向  
+        void setDirection(Direction dir) {
+            direction = dir;
+            updateLayout();
+        }
+
+        // 设置对齐方式  
+        void setAlignment(Alignment align) {
+            alignment = align;
+            updateLayout();
+        }
+
+        // 设置内边距  
+        void setPadding(float top, float right, float bottom, float left) {
+            padding.top = top;
+            padding.right = right;
+            padding.bottom = bottom;
+            padding.left = left;
+            updateLayout();
+        }
+
+        // 设置间距  
+        void setGap(float g) {
+            gap = g;
+            updateLayout();
+        }
+
+        // 设置样式  
+        void setStyle(Color fill, Color stroke, float strokeW, float corner) {
+            fillColor = fill;
+            strokeColor = stroke;
+            strokeWidth = strokeW;
+            cornerRadius = corner;
+        }
+
+        // 启用/禁用裁剪  
+        void setClipsContent(bool clips) {
+            clipsContent = clips;
+        }
+
+        // 更新布局  
+        void updateLayout() {
+            if (children.empty()) return;
+
+            float contentX = rect.x + padding.left;
+            float contentY = rect.y + padding.top;
+            float availableW = rect.w - padding.left - padding.right;
+            float availableH = rect.h - padding.top - padding.bottom;
+
+            if (direction == Direction::Horizontal) {
+                // 水平布局  
+                float currentX = contentX;
+                for (auto& child : children) {
+                    if (!child->visible) continue;
+
+                    child->rect.x = currentX;
+                    child->rect.y = contentY;
+
+                    // 根据对齐方式调整 Y 坐标  
+                    if (alignment == Alignment::Center) {
+                        child->rect.y += (availableH - child->rect.h) / 2.0f;
+                    }
+                    else if (alignment == Alignment::End) {
+                        child->rect.y += availableH - child->rect.h;
+                    }
+                    else if (alignment == Alignment::Stretch) {
+                        child->rect.h = availableH;
+                    }
+
+                    currentX += child->rect.w + gap;
+                }
+            }
+            else {
+                // 垂直布局  
+                float currentY = contentY;
+                for (auto& child : children) {
+                    if (!child->visible) continue;
+
+                    child->rect.x = contentX;
+                    child->rect.y = currentY;
+
+                    // 根据对齐方式调整 X 坐标  
+                    if (alignment == Alignment::Center) {
+                        child->rect.x += (availableW - child->rect.w) / 2.0f;
+                    }
+                    else if (alignment == Alignment::End) {
+                        child->rect.x += availableW - child->rect.w;
+                    }
+                    else if (alignment == Alignment::Stretch) {
+                        child->rect.w = availableW;
+                    }
+
+                    currentY += child->rect.h + gap;
+                }
+            }
+        }
+
+        void render(tvg::Scene* parent) override {
+            if (!visible) return;
+
+            // 渲染背景  
+            if (enableFill || enableStroke) {
+                auto bg = tvg::Shape::gen();
+                bg->appendRect(rect.x, rect.y, rect.w, rect.h, cornerRadius, cornerRadius);
+
+                if (enableFill) {
+                    bg->fill(fillColor.r, fillColor.g, fillColor.b, fillColor.a);
+                }
+
+                if (enableStroke) {
+                    bg->strokeFill(strokeColor.r, strokeColor.g, strokeColor.b, strokeColor.a);
+                    bg->strokeWidth(strokeWidth);
+                }
+
+                bg->opacity(static_cast<uint8_t>(opacity * 255));
+                parent->push(std::move(bg));
+            }
+
+            // 渲染子元素    
+            if (clipsContent) {
+                // 创建裁剪场景 (返回原始指针)  
+                auto clipScene = tvg::Scene::gen();
+
+                // 创建裁剪遮罩 (返回原始指针)  
+                auto clipMask = tvg::Shape::gen();
+                clipMask->appendRect(rect.x, rect.y, rect.w, rect.h, cornerRadius, cornerRadius);
+
+                // 使用 clip() 方法,传递原始指针  
+                clipScene->clip(clipMask);
+
+                // 添加子元素 (clipScene 已经是原始指针,直接使用)  
+                for (auto& child : children) {
+                    if (child->visible) {
+                        child->render(clipScene);  // 不需要 .get()  
+                    }
+                }
+
+                // 将裁剪场景添加到父场景 (传递原始指针)  
+                parent->push(clipScene);  // 不需要 std::move()  
+            }
+            else {
+                for (auto& child : children) {
+                    if (child->visible) {
+                        child->render(parent);
+                    }
+                }
+            }
+        }
+
+        bool hitTest(float px, float py) override {
+            return rect.contains(px, py);
+        }
+
+        void onMMove(float px, float py) override {
+            for (auto& child : children) {
+                if (child->hitTest(px, py)) {
+                    child->onMMove(px, py);
+                }
+            }
+        }
+
+        void onMDown(float px, float py) override {
+            for (auto& child : children) {
+                if (child->hitTest(px, py)) {
+                    child->onMDown(px, py);
+                }
+            }
+        }
+
+        void onMWheel(float px, float py, int delta) override {
+            for (auto& child : children) {
+                if (child->hitTest(px, py)) {
+                    child->onMWheel(px, py, delta);
+                }
+            }
+        }
+    };
+
+} // namespace MUI
 
 // UIButton 类  
 namespace MUI {
@@ -3283,14 +3529,12 @@ namespace MUI {
             parent->push(std::move(scrollbar));
         }
 
-        // ========================================================================  
-        // 交互处理  
-        // ========================================================================  
 
     public:
         bool hitTest(float px, float py) override {
             return rect.contains(px, py);
         }
+
         void onMMove(float px, float py) override {
             if (!visible || !hitTest(px, py)) {
                 hoveredIndex = -1;
@@ -3330,6 +3574,10 @@ namespace MUI {
             int maxFirstIndex = std::max(0, static_cast<int>(items.size()) - VISIBLE_COUNT);
             firstVisibleIndex = std::clamp(firstVisibleIndex, 0, maxFirstIndex);
         }
+
+        void onSize(int w, int h) override {
+			ODD(L"PlayList::onSize: x=%d, y=%d,w=%d, h=%d\n",rect.x,rect.y,w, h);
+		}
 
 private:
     int getItemIndexAt(float px, float py) const {
@@ -3826,239 +4074,4 @@ namespace MUI {
 
 } // namespace MUI
 
-// UIFrame 控件 
-namespace MUI {
 
-    class UIFrame : public UIElement {
-    private:
-        // 子元素列表  
-        std::vector<std::unique_ptr<UIElement>> children;
-
-        // 布局属性  
-        struct {
-            float top = 0, right = 0, bottom = 0, left = 0;
-        } padding;
-
-        float gap = 0.0f;  // 子元素间距  
-
-        enum class Direction { Horizontal, Vertical } direction = Direction::Vertical;
-        enum class Alignment { Start, Center, End, Stretch } alignment = Alignment::Start;
-
-        // 视觉样式  
-        Color fillColor = Color(255, 255, 255, 255);
-        bool enableFill = true;
-        Color strokeColor = Color(200, 200, 200, 255);
-        float strokeWidth = 1.0f;
-        bool enableStroke = false;
-        float cornerRadius = 0.0f;
-        float opacity = 1.0f;
-
-        // 裁剪和滚动  
-        bool clipsContent = false;
-        float scrollOffsetX = 0.0f;
-        float scrollOffsetY = 0.0f;
-
-    public:
-        UIFrame() {
-            rect = { 0, 0, 100, 100 };
-        }
-
-        ~UIFrame() noexcept override {
-            children.clear();
-        }
-
-        // 添加子元素  
-        void addChild(std::unique_ptr<UIElement> child) {
-            children.push_back(std::move(child));
-            updateLayout();
-        }
-
-        // 移除子元素  
-        void removeChild(UIElement* child) {
-            children.erase(
-                std::remove_if(children.begin(), children.end(),
-                    [child](const auto& c) { return c.get() == child; }),
-                children.end()
-            );
-            updateLayout();
-        }
-
-        // 设置布局方向  
-        void setDirection(Direction dir) {
-            direction = dir;
-            updateLayout();
-        }
-
-        // 设置对齐方式  
-        void setAlignment(Alignment align) {
-            alignment = align;
-            updateLayout();
-        }
-
-        // 设置内边距  
-        void setPadding(float top, float right, float bottom, float left) {
-            padding.top = top;
-            padding.right = right;
-            padding.bottom = bottom;
-            padding.left = left;
-            updateLayout();
-        }
-
-        // 设置间距  
-        void setGap(float g) {
-            gap = g;
-            updateLayout();
-        }
-
-        // 设置样式  
-        void setStyle(Color fill, Color stroke, float strokeW, float corner) {
-            fillColor = fill;
-            strokeColor = stroke;
-            strokeWidth = strokeW;
-            cornerRadius = corner;
-        }
-
-        // 启用/禁用裁剪  
-        void setClipsContent(bool clips) {
-            clipsContent = clips;
-        }
-
-        // 更新布局  
-        void updateLayout() {
-            if (children.empty()) return;
-
-            float contentX = rect.x + padding.left;
-            float contentY = rect.y + padding.top;
-            float availableW = rect.w - padding.left - padding.right;
-            float availableH = rect.h - padding.top - padding.bottom;
-
-            if (direction == Direction::Horizontal) {
-                // 水平布局  
-                float currentX = contentX;
-                for (auto& child : children) {
-                    if (!child->visible) continue;
-
-                    child->rect.x = currentX;
-                    child->rect.y = contentY;
-
-                    // 根据对齐方式调整 Y 坐标  
-                    if (alignment == Alignment::Center) {
-                        child->rect.y += (availableH - child->rect.h) / 2.0f;
-                    }
-                    else if (alignment == Alignment::End) {
-                        child->rect.y += availableH - child->rect.h;
-                    }
-                    else if (alignment == Alignment::Stretch) {
-                        child->rect.h = availableH;
-                    }
-
-                    currentX += child->rect.w + gap;
-                }
-            }
-            else {
-                // 垂直布局  
-                float currentY = contentY;
-                for (auto& child : children) {
-                    if (!child->visible) continue;
-
-                    child->rect.x = contentX;
-                    child->rect.y = currentY;
-
-                    // 根据对齐方式调整 X 坐标  
-                    if (alignment == Alignment::Center) {
-                        child->rect.x += (availableW - child->rect.w) / 2.0f;
-                    }
-                    else if (alignment == Alignment::End) {
-                        child->rect.x += availableW - child->rect.w;
-                    }
-                    else if (alignment == Alignment::Stretch) {
-                        child->rect.w = availableW;
-                    }
-
-                    currentY += child->rect.h + gap;
-                }
-            }
-        }
-
-        void render(tvg::Scene* parent) override {
-            if (!visible) return;
-
-            // 渲染背景  
-            if (enableFill || enableStroke) {
-                auto bg = tvg::Shape::gen();
-                bg->appendRect(rect.x, rect.y, rect.w, rect.h, cornerRadius, cornerRadius);
-
-                if (enableFill) {
-                    bg->fill(fillColor.r, fillColor.g, fillColor.b, fillColor.a);
-                }
-
-                if (enableStroke) {
-                    bg->strokeFill(strokeColor.r, strokeColor.g, strokeColor.b, strokeColor.a);
-                    bg->strokeWidth(strokeWidth);
-                }
-
-                bg->opacity(static_cast<uint8_t>(opacity * 255));
-                parent->push(std::move(bg));
-            }
-
-            // 渲染子元素    
-            if (clipsContent) {
-                // 创建裁剪场景 (返回原始指针)  
-                auto clipScene = tvg::Scene::gen();
-
-                // 创建裁剪遮罩 (返回原始指针)  
-                auto clipMask = tvg::Shape::gen();
-                clipMask->appendRect(rect.x, rect.y, rect.w, rect.h, cornerRadius, cornerRadius);
-
-                // 使用 clip() 方法,传递原始指针  
-                clipScene->clip(clipMask);
-
-                // 添加子元素 (clipScene 已经是原始指针,直接使用)  
-                for (auto& child : children) {
-                    if (child->visible) {
-                        child->render(clipScene);  // 不需要 .get()  
-                    }
-                }
-
-                // 将裁剪场景添加到父场景 (传递原始指针)  
-                parent->push(clipScene);  // 不需要 std::move()  
-            }
-            else {
-                for (auto& child : children) {
-                    if (child->visible) {
-                        child->render(parent);
-                    }
-                }
-            }
-        }
-
-        bool hitTest(float px, float py) override {
-            return rect.contains(px, py);
-        }
-
-        void onMMove(float px, float py) override {
-            for (auto& child : children) {
-                if (child->hitTest(px, py)) {
-                    child->onMMove(px, py);
-                }
-            }
-        }
-
-        void onMDown(float px, float py) override {
-            for (auto& child : children) {
-                if (child->hitTest(px, py)) {
-                    child->onMDown(px, py);
-                }
-            }
-        }
-
-        void onMWheel(float px, float py, int delta) override {
-            for (auto& child : children) {
-                if (child->hitTest(px, py)) {
-                    child->onMWheel(px, py, delta);
-                }
-            }
-        }
-    };
-
-} // namespace MUI
