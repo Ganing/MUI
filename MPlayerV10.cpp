@@ -3318,6 +3318,7 @@ int main() {
     rebuildUI();
 
     st.app.setSizeCallback([&](uint32_t w, uint32_t h) {
+        wglMakeCurrent(st.app.getDC(), st.app.getGLRC());  // make GL context current for FBO/Filament ops
         width = w; height = h;
         if (st.view) st.view->setViewport({0, 0, w, h});
         if (st.quadEntity) {
@@ -3519,6 +3520,7 @@ int main() {
         }
 
         // FPS
+        if (!st.needRebuildUI) {  // guard: size callback may have destroyed UI elements
         frameCount++; fpsTimer += dt;
         if (fpsTimer >= 0.5f) {
             st.fps = frameCount / fpsTimer;
@@ -3526,11 +3528,13 @@ int main() {
             if (st.fpsLabelPtr) st.fpsLabelPtr->setText(st.fpsText);
             frameCount = 0; fpsTimer = 0.0f;
         }
+        }  // !needRebuildUI guard
 
         // Update time & sync text
         double audioClock = st.audioSamplesPlayed.load() / (double)st.AUDIO_SAMPLE_RATE;
         st.videoTime = audioClock; // use audio clock as master time
         updateLyrics(st);
+        if (!st.needRebuildUI) {  // guard: size callback may have destroyed UI elements
         if (st.timeLabelPtr) {
             char cur[16], dur[16];
             formatTime(cur, sizeof(cur), st.videoTime);
@@ -3555,6 +3559,7 @@ int main() {
             }
             st.frameLabelPtr->setText(st.frameText);
         }
+        }  // !needRebuildUI guard
 
         // Playback
         if (st.isPlaying) {
