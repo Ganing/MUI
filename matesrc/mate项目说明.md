@@ -2,7 +2,7 @@
 
 > Windows 壁纸引擎 —— Win32 + threepp + ImGui + FFmpeg + miniaudio 单 exe 桌面特效应用
 > 建立日期：2026-10-25
-> 当前版本：v5（P10 音视频打磨：局部上传 + 时间轴缩略图 + 播放列表拖拽/按目录建队列；P1~P10 全部实测通过）+ matex0（P12：OpenGL 4.5 / Win32 Canvas 分支，2026-10-28）+ matex1（Stillwater 程序化场景）+ matex2（P13：threepp 示例学习沙箱）+ P14 视频帧源独立成类 / 解码时直接缩放 / YUV420P 三平面 + 双 PBO / 接入 StillWater 场景层（2026-11-07）
+> 当前版本：v5（P10 音视频打磨：局部上传 + 时间轴缩略图 + 播放列表拖拽/按目录建队列；P1~P10 全部实测通过）+ matex0（P12：OpenGL 4.5 / Win32 Canvas 分支，2026-10-28）+ matex1（Stillwater 程序化场景）+ matex2（P13：threepp 示例学习沙箱）+ P14 视频帧源独立成类 / 解码时直接缩放 / YUV420P 三平面 + 双 PBO / 接入 StillWater 场景层（2026-11-07）+ P15 matex2 加载 glTF 模型 / 动画片段 / 灯光 / 桌面壁纸挂载（2026-11-07）+ P16 matex2 去控制台 / ImGui 日志窗口 / 壁纸挂载按 oapp.h 重写并实测（2026-11-07）+ P17 音频后端改 WASAPI（修 WinMM 回调迟到导致的卡顿）/ 音频时钟单位修复（2026-11-07）
 > 场景系统设定（MScene / ma.bin / mate.json / 层与 Lua）见 §十；引擎底座已由 matex0 复刻并拆成 `src/` 多文件，产物 `mate.exe`（2026-11-06）
 
 ---
@@ -56,10 +56,10 @@ e:\MX\Projects\Mate\
 ├── matev5.cpp           # P10 音视频打磨：局部上传 + 时间轴缩略图 + 播放列表（当前版本）
 ├── matex0.cpp           # P12 matex 分支：OpenGL 4.5 + Win32 Canvas + OrbitControls（实验版本）
 ├── matex1.cpp           # x1 分支：Stillwater 程序化场景（学习/素材参考，不做产品）
-├── matex2.cpp           # P13 threepp 学习沙箱：01_intro/11_texture2d（TextureLoader/Reflector/OrbitControls）
+├── matex2.cpp           # P13/P15 threepp 学习沙箱：11_texture2d + glTF 模型/动画 + 灯光 + 壁纸挂载 + ImGui 面板
 ├── matex.rc             # x0/x2 资源脚本：仅窗口图标(103/104)，不含字体/模型
 ├── matex0.bat           # x0 编译脚本：matex0.bat [debug|wallpaper] [run]
-├── matex2.bat           # x2 编译脚本：matex2.bat [debug] [run]（console 子系统，无 ImGui）
+├── matex2.bat           # x2 编译脚本：matex2.bat [debug] [run]（windows 子系统，无控制台；日志在 ImGui 窗口）
 ├── mate.rc              # 资源脚本：内嵌字体(101) + 默认模型(102) + 窗口图标(103/104)
 ├── mate.bat             # 编译脚本：mate.bat [v1|v2|v3|v4|v5|x1|mate] [debug|wallpaper] [run]
 ├── mate.exe             # 产品引擎产物（mate.bat mate 生成）
@@ -1810,8 +1810,65 @@ if (video.advance(dt)) {
   2. 解码线程按水位反压（`kAudioHighWater = 36000` 样本 ≈ 0.375 s），宁可视频慢半拍，也不能写满丢样本
   3. `advanceThreaded` 一次只摘**最早的一帧**到期帧（`kDueSlack = 0.012`）；"摘多帧只显示最后一帧"等于主动丢帧，30 fps 素材会成片丢帧（实测丢 23%）
   验证：55 s 连续运行，已解 = 已显示（1612/1612），欠载 0，队列稳定在 0.36–0.40 s，165 fps
+- **声音仍然卡顿（2026-11-07 二次修复）**：上面修的是"丢样本"，这轮实测数据侧已经完全健康（缓冲 0.39 s、欠载 0 ms、已解 = 已显示），卡顿来自**输出线程被拖慢**，而不是队列缺数据。`MA_NO_WASAPI` 把后端钉死在 WinMM，waveOut 的通知线程在渲染压力下频繁迟到 → 硬件缓冲跑空 → 断续。量化对比（`SpatialVideoAudio::callbackGapMaxMs/callbackLateCount`）：WinMM 每 2 s 拖后约 40 次（14 s 累计 267 次、单次最长 60.5 ms）；去掉 `MA_NO_WASAPI`（保留 `MA_NO_DSOUND`，失败仍自动回退 WinMM）走 WASAPI 共享模式后，拖后只剩 1 次（启动时）、最大间隔 20.5 ms、欠载恒 0。切换方式：`mate_audio3d.cpp` 顶部不再定义 `MA_NO_WASAPI`；面板与日志保留 `缓冲 / 欠载 / 回调周期 / 最大间隔 / 拖后次数` 五项指标，方便下次直接看数值而不是靠耳朵
+- 顺带修 `AudioQueue::consumedSeconds()` 的单位错误：`totalRead` 计的是**交错 float 样本**（帧 × 声道），除数应为 `rate * 声道数`；原实现少乘声道数，音频时钟快一倍，等于"永远有帧到期"，A/V 同步实际没生效
 
-**实测（matex2，tvb1.mp4 720×1280）**：`[音频] 音轨已挂到 3D 音源（48000 Hz / 2 ch）`，队列稳定在 0.36–0.40 s 缓冲，连续 55 s 无欠载、无丢帧，165 fps，解码 0.4 ms，退出正常。
+**实测（matex2，tvb1.mp4 720×1280）**：`[音频] 已挂载（后端 WASAPI）`，队列稳定在 0.38–0.40 s 缓冲；52 s 连续运行（跨过一次 40.9 s 循环点）累计欠载 0 ms、回调拖后 1 次（仅启动）、已解 = 已显示（1547/1547），165 fps，解码 0.42 ms，退出正常。
+
+### 11.6 matex2：模型 / 动画 / 灯光 / 壁纸挂载（P15，壁纸重写于 P16）
+
+**目标**：把 matex0 的四项能力搬回最小外壳，验证 threepp 的 `GLTFLoader` / `AnimationMixer` / 灯光 / WorkerW 挂载在「多物体场景 + 视频 + 3D 音频」共存时不打架。
+
+**代码位置**：[matex2.cpp](file:///e:/MX/Projects/Mate/matex2.cpp) 的 `scanModels` / `resolveModelDir` / `applyModel` / `applyClip`、`detectDesktopLayers` / `mountWallpaper` / `unmountWallpaper` / `interactRegionContainsClient` / `wallpaperMouseHook`、`mateLog` / ImGui 日志窗口、`main()` 里的灯光段与主循环。
+
+**模型与动画**：
+
+| 环节 | 做法 |
+|---|---|
+| 目录 | `exeDir()/models` → `exeDir()/Data/models` → `e:/MX/Data/models`；递归扫 `.glb`/`.gltf`（扩展名转小写再比） |
+| 摆位 | `Box3::setFromObject` 取包围盒，最大边缩到 2.2，`position = anchor − center * scale`（把包围盒中心摆到 anchor），anchor 默认 `(0, 0.25, 1.2)` 即视野正中 |
+| 交互半径 | `g_interactRadius = 0.5 * maxEdge * scale`，`g_interactCenter = anchor`，给壁纸鼠标钩子与拖动判定做屏幕投影用 |
+| 拖动 | 普通窗口下左键按在模型投影圆内 → `handleModelDrag()` 接管鼠标（不喂给 OrbitControls），按屏幕像素换算成世界位移：`right = dir × up_world`、`up = right × dir`，`pxPerUnit = ch/2 / (dist*tan(fov/2))`；移动时同步 `position` / `g_interactCenter` / `g_modelAnchor`，面板「模型居中」一键回到 `(0,0.25,1.2)` |
+| 换模型 | **先** `mixer.reset()` → `clips.clear()` → `g_modelRoot=nullptr` → `removeFromParent()` → `modelRoot.reset()`，**再**接新模型；顺序反了 mixer 会持有已释放的根节点，拖动逻辑也会摸到悬空指针 |
+| 动画 | `clipAction(clip)->setLoop(Loop::Repeat,-1)->reset().play()`；换片段/开关播放统一走 `applyClip()`（内部先 `stopAllAction()`） |
+
+**灯光**：`AmbientLight(0xffffff, 0.45)` + `DirectionalLight` 主光 `(2.4,3.6,3.2)` 强度 2.2 + 补光 `0x8899ff` `(-3.0,-1.5,-2.0)` 强度 0.8，三盏的 `intensity` 直接给面板滑块改。**内置的 sphere / box / plane / 面片全是 `MeshBasicMaterial`，不受灯光影响**；只有 glTF 的 PBR 材质吃灯，所以"加灯后旧物体没变化"是预期行为。
+
+**壁纸挂载**（P16 起按 [oapp.h](file:///e:/MX/MO/oapp.h) `enterWallpaperMode` 的成功做法重写，旧版 `collectWallpaperParents` / `restyleAsWallpaperChild` / `HWND_BOTTOM` 方案已删）：
+
+| 步骤 | 做法 |
+|---|---|
+| 1. 唤醒壁纸层 | `SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &r)` + `Sleep(100)`；同一条消息连发两次会幂等 |
+| 2. 选父窗口 | `FindWindowExW(progman, nullptr, L"SHELLDLL_DefView", nullptr)` **存在** → 本机 Win11「无壁纸模式」，父窗口=`Progman`、图标层=`DefView`；否则枚举顶层 `WorkerW`，带 `DefView` 的记作图标层，**可见且无 DefView** 的记作壁纸层；Legacy 下壁纸层是图标层 WorkerW 的下一个兄弟 |
+| 3. 改样式 | 进模式前存 `savedStyle/savedExStyle/savedRect`（**重挂时只在 `!g_wp.wallpaper` 才存**，否则原始值被覆盖就还原不回来）；`style \|= WS_CHILD\|WS_VISIBLE` 并清 `WS_CAPTION\|WS_THICKFRAME\|WS_POPUP`，`exStyle \|= WS_EX_LAYERED` 并清 `WS_EX_APPWINDOW`，再 `SetLayeredWindowAttributes(hwnd, 0, 0xFF, LWA_ALPHA)` |
+| 4. 挂载 | `SetParent` 失败直接 `mateLog` 错误码 + 还原样式退回窗口模式；成功后按 `virtualScreenRect()` 全屏 `SetWindowPos(..., SWP_FRAMECHANGED)`，再接一次 `SetWindowPos(hwnd, L.icons, ..., SWP_NOMOVE\|SWP_NOSIZE)` **把自己排到图标层后面**，最后 `ShowWindow(L.parent, SW_SHOW)`（0x052C 刚造出来的壁纸层可能还藏着） |
+| 5. 收尾 | `g_canvas->syncClientSize()` → `[窗口] 尺寸 2560x1440`；退出时原样还原样式/位置 + `ShowWindow(SW_NORMAL)` + `SetForegroundWindow`，`GetParent()` 可复核 |
+
+**关键点**：只把 `WS_CHILD` 挂上去是不够的——不排到图标层后面、不加 `WS_EX_LAYERED`、不 `ShowWindow(parent)`，窗口会"挂上了但桌面毫无变化"（旧版就是这样，日志还能打印成功）。用户可见的验收标准是：按 F5 后 Win+D 看桌面，3D 场景成为壁纸且桌面图标压在场景之上（2026-11-07 截图已确认）。
+
+**壁纸交互**（`WH_MOUSE_LL` 只观察、不拦截桌面）：
+
+- `cursorOverInteractRegion()` 手动把 `g_interactCenter` 投到客户区像素坐标：`viewProj = projectionMatrix * matrixWorldInverse`（本版 `Matrix4` **没有 `operator*`**，用 `multiplyMatrices` + 按列主序取 `elements`），`clipW <= 0` 视为在相机背后；半径像素 = `ch/2 / (dist * tan(fov/2)) * g_interactRadius`，下限 24 px
+- 只有光标落在投影圆内才吞 `LBUTTONDOWN` / `RBUTTONDOWN` / `WHEEL`，拖拽期间（`dragging` / `rmbDown`）即使移出圆也继续转发；其余事件 `CallNextHookEx` 直接放给桌面
+- 事件走 `canvas.feedMouseDown/Up/Move/Wheel()` 注入 `PeripheralsEventSource`，与真实鼠标走同一套监听器，OrbitControls 不需要任何改动
+
+**热键**（`RegisterHotKey`，壁纸模式下窗口没有焦点也能触发）：F5 壁纸开关、F6 面板、F8 壁纸交互开关、F9 复位视角、F12 退出。`WndProc` 只置 `g_wp.wantToggle/wantRemount/wantResetView/wantQuit` 标志，**真正的 `SetParent` / 钩子安装放在主循环开头消费**——在窗口过程里做重活会卡住消息泵。`WM_DISPLAYCHANGE` / `WM_SETTINGCHANGE` 触发 `wantRemount`（换分辨率或 Explorer 重启后重新挂）。
+
+**热键注册失败兜底**：注册失败（本机 F12 报 1409 `ERROR_HOTKEY_ALREADY_REGISTERED`，被别的程序占了）时 `g_hotkeysRegistered=false` 并写日志；此时 `WM_KEYDOWN` 里自己判断 F5/F6/F8/F9/F12 置同样的标志，保证窗口有焦点时功能不丢。两套路径互斥（只在 `!g_hotkeysRegistered` 时走 `WM_KEYDOWN`），不会双触发。
+
+**无控制台 + ImGui 日志窗口**（P16）：`matex2.bat` 链接改为 `/subsystem:windows /ENTRY:mainCRTStartup`（保留 `int main()`），全部 `printf` 换成 `mateLog(fmt, ...)`——`vsnprintf` → 去掉行尾 `\n` → 塞进 `std::deque<std::string>` 环形队列（上限 200 行）。日志窗口 `"matex2 日志"`（右上角、可 `清空`/显示行数、`BeginChild` 里自动滚底）在 `ImGui::Render()` 前绘制，壁纸模式下不画；面板底部有「显示日志窗口」勾选。**没有控制台之后，日志窗口是唯一的诊断入口，截图裁剪放大即可读**。
+
+**踩坑**：
+
+- 壁纸模式必须跳过 `handleMessage()`（鼠标由钩子注入）和 ImGui 面板绘制，否则面板会画到桌面壁纸上；`WM_NCHITTEST` 返回 `HTTRANSPARENT` 让点击穿透到桌面图标
+- `OrbitControls` 的 `target` / `getDistance()` 是公开的，`cursorOverInteractRegion` 依赖 `getDistance()` 换算像素半径；相机与控件指针要在 `main()` 里记到 `g_camera` / `g_controls`，钩子跑在系统线程上，不能捕获栈上的 `shared_ptr`
+- 面板默认宽 430 px、贴左上角，模型默认摆在视野正中就不会被挡；想挪位置用面板里的「拖动模型（左键按住模型）」勾选 + 直接拖，拖到哪儿都行
+- **ImGui 中文缺字**：`GetGlyphRangesChineseSimplifiedCommon()` 只有 2500 常用字，"频"（音频）、"帧"（已解/已显示帧）都不在表里，会渲染成空白方块。用 `ImFontGlyphRangesBuilder`：`AddRanges(常用字)` + `AddText("面板实际用到的字…")` + `BuildRanges()`，再把 `ranges.Data` 传给 `AddFontFromFileTTF`
+- 拖动模型时只接管 `WM_LBUTTONDOWN`（命中投影圆）与其后的 `WM_MOUSEMOVE/UP`，其余鼠标事件照旧给 OrbitControls，所以"拖模型"和"转相机"不冲突
+- 截图验证时若面板盖住模型，先按 F6 隐藏面板再 `CopyFromScreen`（本机实测可抓到 GL 窗口内容，与 §11.3 的旧结论不同，可能是因为这里没有用 WS_EX_LAYERED）
+- 自动化验证壁纸时不用真的敲 F5：`PostMessage(hwnd, WM_HOTKEY, 1001, 0)` 就能走同一段 `WndProc`；PowerShell 里 `FindWindow('Progman', $null)` 的 `$null` 会变成空串导致查不到窗口，必须用 `[NullString]::Value`
+
+**实测（2026-11-07，BrainStem.glb）**：`[模型] 目录 e:/MX/Data/models，共 22 个` / `[动画] 共 1 段：animation_0` / `[模型] 已就位（交互半径 1.10）`；F5 后 `[壁纸] 已挂到 Modern（DefView 在 Progman）（WorkerW 数=2，图标层=0x…）`，客户区 1296×759 → 2560×1440，`GetParent()` = `Progman`(0x1014A)、`style` = `0x540B0000`（`WS_CHILD|WS_VISIBLE`，无 `WS_CAPTION/THICKFRAME`）；Win+D 截图确认 3D 场景成为壁纸、桌面图标在场景之上。再按 F5：`GetParent()` 回 0、`style` 精确还原为 `0x14CF0000`、`exStyle` `0x100`、窗口矩形回到 `632,340,1928,1099`，`[壁纸] 已退回普通窗口`，全程 156~165 fps、视频解码 ~0.4 ms，F12 正常退出。
 
 ---
 

@@ -1,16 +1,18 @@
 /****************************************************************************
  * 标题: matex2 - threepp 学习沙箱
  * 功能: 复刻 ThreeppVSTest 的 01_intro/11_texture2d 示例：
- *       TextureLoader 贴图 + Sphere/Box/Plane + Reflector 实时镜面 + OrbitControls
+ *       TextureLoader 贴图 + Sphere/Box/Plane + Reflector 实时镜面 + OrbitControls；
+ *       在此基础上按 matex0 的写法补了 glTF 模型（含动画片段）、三盏灯、
+ *       桌面壁纸挂载（WorkerW/Progman + 全局鼠标钩子转发）与 ImGui 面板。
  * 说明: 与 matex0 一样不链接 GLFW，用 Win32 + WGL 自建 OpenGL 4.5 上下文；
  *       渲染交给 threepp::GLRenderer(size)，事件转给 PeripheralsEventSource。
- *       与 matex0 的差别：这是个人学习用的最小外壳，没有壁纸挂载与 ImGui 面板，
  *       走 console 子系统，日志直接 printf 到控制台。
  *
  * 依赖: ../../3rd/lib/threepp_mt.lib（/MT）、WS2_32、matex.rc（仅窗口图标）
- * 资源: Data/textures/{checker.png, crate.gif, brick_bump.jpg}
+ * 资源: Data/textures/{checker.png, crate.gif, brick_bump.jpg}、Data/models/*.glb|gltf
  *
  * 操作: 左键旋转 / 右键平移 / 滚轮缩放 / ESC 退出
+ *       F5 壁纸模式 / F6 面板 / F8 壁纸交互 / F9 复位视角 / F12 退出
  ****************************************************************************/
 
 #define NOMINMAX
@@ -20,6 +22,12 @@
 
 #include <glad/glad.h>
 
+#include "threepp/animation/AnimationMixer.hpp"
+#include "threepp/lights/AmbientLight.hpp"
+#include "threepp/lights/DirectionalLight.hpp"
+#include "threepp/loaders/GLTFLoader.hpp"
+#include "threepp/math/Box3.hpp"
+#include "threepp/objects/Group.hpp"
 #include "threepp/cameras/OrthographicCamera.hpp"
 #include "threepp/cameras/PerspectiveCamera.hpp"
 #include "threepp/canvas/Canvas.hpp"   // 只为下面的 initWindow 空实现
@@ -35,6 +43,7 @@
 #include "threepp/materials/MeshBasicMaterial.hpp"
 #include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/math/MathUtils.hpp"
+#include "threepp/math/Matrix4.hpp"
 #include "threepp/math/Vector4.hpp"
 #include "threepp/objects/Mesh.hpp"
 #include "threepp/objects/Reflector.hpp"
@@ -56,10 +65,15 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include "src/core/mate_video.h"   // 引擎无关视频帧源（MO/xav.h 解码 + 独立线程）
 #include "src/core/mate_audio3d.h" // 视频音轨 -> miniaudio 3D 空间音源
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -88,6 +102,69 @@ static const int kDefaultWidth  = 1280;
 static const int kDefaultHeight = 720;
 
 static class Win32Canvas* g_canvas = nullptr;
+
+/*==================== 日志（无控制台，写进环形队列给 ImGui 日志窗口显示） ====================*/
+static constexpr size_t kLogMaxLines = 200;
+static std::deque<std::string> g_logLines;
+static bool g_showLog = true;
+
+static void mateLog(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    // 老代码里的格式串带 '\n'（给控制台用），转成 IMGUI 单行时去掉
+    const size_t n = std::strlen(buf);
+    if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = '\0';
+    if (g_logLines.size() >= kLogMaxLines) g_logLines.pop_front();
+    g_logLines.emplace_back(buf);
+}
+
+/*==================== 壁纸模式 / 交互状态 ====================*/
+// 热键：F5 壁纸切换、F6 面板、F8 交互开关、F9 复位视角、F12 退出
+enum HotkeyId {
+    kHotkeyWallpaper = 1001,
+    kHotkeyPanel     = 1002,
+    kHotkeyInteract  = 1003,
+    kHotkeyResetView = 1004,
+    kHotkeyQuit      = 1005,
+};
+
+struct WallpaperState {
+    bool wallpaper = false;           // 已挂到桌面壁纸层
+    bool interactive = true;          // 壁纸模式下是否响应模型上的鼠标
+    bool dragging = false;            // 正在拖拽模型区域（左键）
+    bool rmbDown = false;             // 右键平移进行中
+    bool wantToggle = false;          // 下面几个都由主循环消费，避免在 WndProc 里做重活
+    bool wantRemount = false;
+    bool wantResetView = false;
+    bool wantQuit = false;
+    bool showPanel = true;
+    // 进壁纸模式前的窗口原始状态，退出时原样还原
+    LONG_PTR savedStyle   = 0;
+    LONG_PTR savedExStyle = 0;
+    RECT     savedRect    = { 0, 0, 0, 0 };
+};
+static WallpaperState g_wp;
+
+static threepp::PerspectiveCamera* g_camera = nullptr;   // 壁纸钩子用它算屏幕投影
+static threepp::OrbitControls*    g_controls = nullptr;
+static float g_cameraBaseDistance = 5.0f;
+static threepp::Vector3 g_interactCenter{0.0f, 0.0f, 0.0f};
+static float g_interactRadius = 1.0f;
+static HHOOK g_mouseHook = nullptr;
+
+/*==================== 模型拖动（普通窗口下的左键拖拽） ====================*/
+static threepp::Group*  g_modelRoot = nullptr;   // 当前模型根节点，拖动直接改 position
+static threepp::Vector3 g_modelAnchor(0.0f, 0.25f, 1.2f);   // 包围盒中心的世界坐标
+static bool  g_modelDragEnabled = true;
+static bool g_hotkeysRegistered = false;   // 注册失败时退回 WM_KEYDOWN（只在窗口有焦点时管用）
+static bool  g_modelDragging = false;
+static POINT g_modelDragStart{};
+static threepp::Vector3 g_modelDragOrigin;
+
+static bool handleModelDrag(UINT msg, LPARAM lParam);   // 实现在交互投影函数之后
 
 // VK -> threepp::Key（与 GLFW 的 Key 枚举同序）
 static threepp::Key toThreeppKey(WPARAM vk) {
@@ -155,6 +232,13 @@ public:
     bool pumpEvents();
     void swapBuffers() const { if (hdc_) SwapBuffers(hdc_); }
 
+    // 壁纸模式：全局鼠标钩子把事件注入 threepp 的监听器
+    void feedMouseDown(int button, float x, float y);
+    void feedMouseUp(int button, float x, float y);
+    void feedMouseMove(float x, float y);
+    void feedMouseWheel(float dy);
+    void syncClientSize();
+
 private:
     bool initGL(bool vsync);
 
@@ -181,15 +265,55 @@ static LRESULT CALLBACK X2WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     const bool skipForImGui = ImGui::GetCurrentContext() != nullptr &&
             ((mouseMsg && ImGui::GetIO().WantCaptureMouse) ||
              (keyMsg && ImGui::GetIO().WantCaptureKeyboard));
-    if (g_canvas && !skipForImGui) g_canvas->handleMessage(msg, wParam, lParam);
+    if (g_canvas && !g_wp.wallpaper && !skipForImGui) {
+        if (!handleModelDrag(msg, lParam)) g_canvas->handleMessage(msg, wParam, lParam);
+    }
 
     switch (msg) {
+    case WM_HOTKEY:
+        switch (wParam) {
+        case kHotkeyWallpaper: g_wp.wantToggle = true; break;
+        case kHotkeyPanel:     g_wp.showPanel = !g_wp.showPanel; break;
+        case kHotkeyInteract:
+            g_wp.interactive = !g_wp.interactive;
+            if (!g_wp.interactive) g_wp.dragging = false;
+            break;
+        case kHotkeyResetView: g_wp.wantResetView = true; break;
+        case kHotkeyQuit:      g_wp.wantQuit = true; break;
+        default: break;
+        }
+        return 0;
+
+    case WM_NCHITTEST:
+        // 壁纸模式：点击一律透传给桌面图标；模型区域的交互走全局鼠标钩子
+        if (g_wp.wallpaper) return HTTRANSPARENT;
+        break;
+
+    case WM_DISPLAYCHANGE:
+    case WM_SETTINGCHANGE:
+        if (g_wp.wallpaper) g_wp.wantRemount = true;   // 分辨率/Explorer 变化后重挂
+        break;
+
     case WM_SIZE:
         if (g_canvas) g_canvas->resize(LOWORD(lParam), HIWORD(lParam));
         return 0;
 
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) PostQuitMessage(0);
+        if (wParam == VK_ESCAPE) {
+            PostQuitMessage(0);
+            return 0;
+        }
+        // 热键被别家占用（注册失败）时，窗口有焦点也能操作
+        if (!g_hotkeysRegistered) {
+            switch (wParam) {
+            case VK_F5:  g_wp.wantToggle = true; return 0;
+            case VK_F6:  g_wp.showPanel = !g_wp.showPanel; return 0;
+            case VK_F8:  g_wp.interactive = !g_wp.interactive; g_wp.dragging = false; return 0;
+            case VK_F9:  g_wp.wantResetView = true; return 0;
+            case VK_F12: g_wp.wantQuit = true; return 0;
+            default: break;
+            }
+        }
         return 0;
 
     case WM_CLOSE:
@@ -222,7 +346,7 @@ static bool registerWindowClass() {
     wc.hIconSm       = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(104));
 
     if (!RegisterClassExW(&wc)) {
-        std::printf("[窗口] 注册窗口类失败: %lu\n", GetLastError());
+        mateLog("[窗口] 注册窗口类失败: %lu\n", GetLastError());
         return false;
     }
     registered = true;
@@ -248,7 +372,7 @@ bool Win32Canvas::create(const std::wstring& title, int width, int height, bool 
             (screenW - winW) / 2, (screenH - winH) / 2, winW, winH,
             nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd_) {
-        std::printf("[窗口] CreateWindowEx 失败: %lu\n", GetLastError());
+        mateLog("[窗口] CreateWindowEx 失败: %lu\n", GetLastError());
         return false;
     }
 
@@ -257,6 +381,21 @@ bool Win32Canvas::create(const std::wstring& title, int width, int height, bool 
     SetForegroundWindow(hwnd_);
 
     if (!initGL(vsync)) return false;
+
+    // 全局热键：壁纸模式下窗口没有焦点/被图标层盖住，只能靠系统热键操作
+    g_hotkeysRegistered = true;
+    auto regHotkey = [&](int id, UINT vk, const char* name) {
+        if (!RegisterHotKey(hwnd_, id, MOD_NOREPEAT, vk)) {
+            g_hotkeysRegistered = false;
+            mateLog("[热键] %s 注册失败（错误 %lu，可能被其他程序占用）", name, GetLastError());
+        }
+    };
+    regHotkey(kHotkeyWallpaper, VK_F5,  "F5 壁纸");
+    regHotkey(kHotkeyPanel,     VK_F6,  "F6 面板");
+    regHotkey(kHotkeyInteract,  VK_F8,  "F8 交互");
+    regHotkey(kHotkeyResetView, VK_F9,  "F9 复位视角");
+    regHotkey(kHotkeyQuit,      VK_F12, "F12 退出");
+    if (g_hotkeysRegistered) mateLog("[热键] F5/F6/F8/F9/F12 注册成功");
 
     RECT client = { 0, 0, 0, 0 };
     GetClientRect(hwnd_, &client);
@@ -288,7 +427,7 @@ void Win32Canvas::destroy() {
 bool Win32Canvas::initGL(bool vsync) {
     hdc_ = GetDC(hwnd_);
     if (!hdc_) {
-        std::printf("[GL] GetDC 失败\n");
+        mateLog("[GL] GetDC 失败\n");
         return false;
     }
 
@@ -307,18 +446,18 @@ bool Win32Canvas::initGL(bool vsync) {
 
     const int pf = ChoosePixelFormat(hdc_, &pfd);
     if (!pf || !SetPixelFormat(hdc_, pf, &pfd)) {
-        std::printf("[GL] 像素格式设置失败\n");
+        mateLog("[GL] 像素格式设置失败\n");
         return false;
     }
 
     // 先建临时上下文，才能拿到 wglCreateContextAttribsARB
     HGLRC tempCtx = wglCreateContext(hdc_);
     if (!tempCtx) {
-        std::printf("[GL] wglCreateContext 失败\n");
+        mateLog("[GL] wglCreateContext 失败\n");
         return false;
     }
     if (!wglMakeCurrent(hdc_, tempCtx)) {
-        std::printf("[GL] 临时上下文 current 失败\n");
+        mateLog("[GL] 临时上下文 current 失败\n");
         wglDeleteContext(tempCtx);
         return false;
     }
@@ -352,7 +491,7 @@ bool Win32Canvas::initGL(bool vsync) {
                 chosen = a.name;
                 break;
             }
-            std::printf("[GL] %s 上下文不可用，尝试下一档\n", a.name);
+            mateLog("[GL] %s 上下文不可用，尝试下一档\n", a.name);
         }
     }
 
@@ -360,17 +499,17 @@ bool Win32Canvas::initGL(bool vsync) {
     wglDeleteContext(tempCtx);
 
     if (!ctx) {
-        std::printf("[GL] 未能创建 3.3+ 上下文，回退 legacy\n");
+        mateLog("[GL] 未能创建 3.3+ 上下文，回退 legacy\n");
         ctx = wglCreateContext(hdc_);
     }
     if (!ctx) {
-        std::printf("[GL] 无法创建 OpenGL 上下文\n");
+        mateLog("[GL] 无法创建 OpenGL 上下文\n");
         return false;
     }
 
     hglrc_ = ctx;
     if (!wglMakeCurrent(hdc_, hglrc_)) {
-        std::printf("[GL] 正式上下文 current 失败\n");
+        mateLog("[GL] 正式上下文 current 失败\n");
         return false;
     }
 
@@ -378,14 +517,14 @@ bool Win32Canvas::initGL(bool vsync) {
     try {
         threepp::loadGlad();
     } catch (const std::exception& e) {
-        std::printf("[GL] glad 加载失败: %s\n", e.what());
+        mateLog("[GL] glad 加载失败: %s\n", e.what());
         return false;
     }
 
     GLint major = 0, minor = 0;
     glGetIntegerv(GL_MAJOR_VERSION, &major);
     glGetIntegerv(GL_MINOR_VERSION, &minor);
-    std::printf("[GL] %s -> %d.%d | %s | %s\n", chosen.c_str(), (int)major, (int)minor,
+    mateLog("[GL] %s -> %d.%d | %s | %s\n", chosen.c_str(), (int)major, (int)minor,
                 (const char*)glGetString(GL_RENDERER),
                 (const char*)glGetString(GL_VERSION));
 
@@ -393,7 +532,7 @@ bool Win32Canvas::initGL(bool vsync) {
             (PFN_wglSwapIntervalEXT)wglGetProcAddress("wglSwapIntervalEXT");
     if (swapInterval) {
         swapInterval(vsync ? 1 : 0);
-        std::printf("[GL] 垂直同步: %s\n", vsync ? "开" : "关");
+        mateLog("[GL] 垂直同步: %s\n", vsync ? "开" : "关");
     }
 
     RECT client = { 0, 0, 0, 0 };
@@ -475,6 +614,33 @@ void Win32Canvas::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     default:
         break;
     }
+}
+
+/*==================== 壁纸模式：事件注入 ====================*/
+void Win32Canvas::feedMouseDown(int button, float x, float y) {
+    mouseDown_[button] = true;
+    onMousePressedEvent(button, threepp::Vector2(x, y), MouseAction::PRESS);
+}
+
+void Win32Canvas::feedMouseUp(int button, float x, float y) {
+    mouseDown_[button] = false;
+    onMousePressedEvent(button, threepp::Vector2(x, y), MouseAction::RELEASE);
+}
+
+void Win32Canvas::feedMouseMove(float x, float y) {
+    onMouseMoveEvent(threepp::Vector2(x, y));
+}
+
+void Win32Canvas::feedMouseWheel(float dy) {
+    onMouseWheelEvent(threepp::Vector2(0.0f, dy));
+}
+
+void Win32Canvas::syncClientSize() {
+    RECT rc = { 0, 0, 0, 0 };
+    GetClientRect(hwnd_, &rc);
+    const int w = (rc.right - rc.left) > 1 ? (int)(rc.right - rc.left) : 1;
+    const int h = (rc.bottom - rc.top) > 1 ? (int)(rc.bottom - rc.top) : 1;
+    resize(w, h);   // 触发外部回调：相机 aspect / renderer->setSize / glViewport
 }
 
 /*==================== 资源路径 ====================*/
@@ -776,6 +942,389 @@ private:
 };
 
 /*==================== 入口 ====================*/
+/*==================== 模型：扫描目录 ====================*/
+struct ModelEntry {
+    std::filesystem::path path;
+    std::string label;
+};
+
+static std::vector<ModelEntry> scanModels(const std::filesystem::path& root) {
+    std::vector<ModelEntry> out;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) return out;
+
+    for (std::filesystem::recursive_directory_iterator it(
+                 root, std::filesystem::directory_options::skip_permission_denied, ec);
+         it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (!it->is_regular_file(ec)) continue;
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (ext != ".glb" && ext != ".gltf") continue;
+
+        ModelEntry e;
+        e.path  = it->path();
+        e.label = std::filesystem::relative(e.path, root, ec).generic_string();
+        if (e.label.empty()) e.label = e.path.filename().string();
+        out.push_back(std::move(e));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const ModelEntry& a, const ModelEntry& b) { return a.label < b.label; });
+    return out;
+}
+
+// 优先 exe 同级的 models（拷走 exe + 目录即可独立运行），没有就退回开发机绝对路径
+static std::filesystem::path resolveModelDir() {
+    std::error_code ec;
+    std::filesystem::path beside = exeDir() / "models";
+    if (std::filesystem::is_directory(beside, ec)) return beside;
+    beside = exeDir() / "Data" / "models";
+    if (std::filesystem::is_directory(beside, ec)) return beside;
+    return "e:/MX/Data/models";
+}
+
+/*==================== 桌面壁纸挂载 ====================*/
+struct ScreenRect { int x = 0, y = 0, w = 0, h = 0; };
+
+static ScreenRect virtualScreenRect() {
+    ScreenRect r;
+    r.x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    r.y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    r.w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    r.h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (r.w <= 0 || r.h <= 0) {
+        r.x = r.y = 0;
+        r.w = GetSystemMetrics(SM_CXSCREEN);
+        r.h = GetSystemMetrics(SM_CYSCREEN);
+    }
+    return r;
+}
+
+enum class DesktopStructure { Unknown, Legacy, Modern };
+
+static const char* structureName(DesktopStructure s) {
+    switch (s) {
+    case DesktopStructure::Legacy: return "Legacy（DefView 在 WorkerW）";
+    case DesktopStructure::Modern: return "Modern（DefView 在 Progman）";
+    default: return "Unknown";
+    }
+}
+
+static int countTopLevelWorkerW() {
+    int n = 0;
+    HWND w = nullptr;
+    while ((w = FindWindowExW(nullptr, w, L"WorkerW", nullptr)) != nullptr) ++n;
+    return n;
+}
+
+// 桌面壁纸层的两张牌：parent 是我们 SetParent 的目标，icons 是图标层（永远在最上面）
+struct WallpaperLayers {
+    HWND parent = nullptr;
+    HWND icons = nullptr;
+    DesktopStructure structure = DesktopStructure::Unknown;
+    bool win11NoWallpaper = false;   // Win11：Progman 直接带 DefView，没有独立壁纸层
+};
+
+// 按 MX 主程序（MO/oapp.h enterWallpaperMode）的成功做法：
+//   1) 先给 Progman 发 0x052C，让 Explorer 建出/露出壁纸层 WorkerW（并等它建好）；
+//   2) 取壁纸层父窗口 + 图标层窗口，挂上以后把自己排在图标层后面，图标才不会被盖住。
+static WallpaperLayers detectDesktopLayers() {
+    WallpaperLayers L;
+    HWND progman = FindWindowW(L"Progman", nullptr);
+    if (!progman) return L;
+
+    DWORD_PTR unused = 0;
+    SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &unused);
+    Sleep(100);
+
+    if (HWND def = FindWindowExW(progman, nullptr, L"SHELLDLL_DefView", nullptr)) {
+        // Win11 无壁纸模式：没有独立壁纸层，挂 Progman，排在 DefView 后面
+        L.win11NoWallpaper = true;
+        L.structure = DesktopStructure::Modern;
+        L.parent = progman;
+        L.icons = def;
+        return L;
+    }
+
+    HWND icons = nullptr;
+    HWND wallpaper = nullptr;
+    HWND w = nullptr;
+    while ((w = FindWindowExW(nullptr, w, L"WorkerW", nullptr)) != nullptr) {
+        if (FindWindowExW(w, nullptr, L"SHELLDLL_DefView", nullptr)) {
+            icons = w;
+        } else if (!wallpaper && IsWindowVisible(w)) {
+            wallpaper = w;   // 夹在一堆隐藏的 136x39 WorkerW 里，只认可见的那个
+        }
+    }
+    L.icons = icons;
+    if (wallpaper) {
+        L.parent = wallpaper;
+        L.structure = DesktopStructure::Modern;
+    } else if (icons) {
+        // Legacy：带 DefView 的 WorkerW 的下一个 WorkerW 才是壁纸层
+        L.parent = FindWindowExW(nullptr, icons, L"WorkerW", nullptr);
+        if (!L.parent) L.parent = icons;
+        L.structure = DesktopStructure::Legacy;
+    } else {
+        L.parent = progman;   // 什么都没找到就挂 Progman 试试
+    }
+    return L;
+}
+
+static void restoreWindowFromWallpaper(HWND hwnd) {
+    SetParent(hwnd, nullptr);
+    SetWindowLongPtrW(hwnd, GWL_STYLE,
+                      g_wp.savedStyle ? g_wp.savedStyle : (WS_OVERLAPPEDWINDOW | WS_VISIBLE));
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_wp.savedExStyle);
+    const RECT rc = g_wp.savedRect;
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    SetWindowPos(hwnd, HWND_TOP,
+                 w > 0 ? rc.left : 40, h > 0 ? rc.top : 40,
+                 w > 0 ? w : kDefaultWidth, h > 0 ? h : kDefaultHeight,
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    ShowWindow(hwnd, SW_NORMAL);
+}
+
+static bool mountWallpaper() {
+    if (!g_canvas || !IsWindow(g_canvas->hwnd())) return false;
+    HWND hwnd = g_canvas->hwnd();
+    WallpaperLayers L = detectDesktopLayers();
+    if (!L.parent) {
+        mateLog("[壁纸] 找不到 Progman / WorkerW（WorkerW 数=%d），保持窗口模式",
+                countTopLevelWorkerW());
+        return false;
+    }
+
+    // 记下原样式/位置，退出壁纸时原样还原（重挂时不能覆盖，否则丢掉原始值）
+    if (!g_wp.wallpaper) {
+        g_wp.savedStyle   = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        g_wp.savedExStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        GetWindowRect(hwnd, &g_wp.savedRect);
+    }
+
+    LONG_PTR style = g_wp.savedStyle | WS_CHILD | WS_VISIBLE;
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_POPUP);
+    LONG_PTR exStyle = (g_wp.savedExStyle | WS_EX_LAYERED) & ~WS_EX_APPWINDOW;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle);
+    // 不透明（alpha=255），只是让桌面能合成这个分层子窗口
+    SetLayeredWindowAttributes(hwnd, 0, 0xFF, LWA_ALPHA);
+
+    SetLastError(0);
+    if (!SetParent(hwnd, L.parent)) {
+        mateLog("[壁纸] SetParent 失败（错误 %lu），保持窗口模式", GetLastError());
+        restoreWindowFromWallpaper(hwnd);
+        return false;
+    }
+
+    const ScreenRect r = virtualScreenRect();
+    SetWindowPos(hwnd, nullptr, r.x, r.y, r.w, r.h, SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    // 排到图标层后面：桌面图标是不透明层，必须在它下面画才不会被盖住
+    if (L.icons && L.icons != L.parent) {
+        SetWindowPos(hwnd, L.icons, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    ShowWindow(L.parent, SW_SHOW);   // 0x052C 刚造出来的壁纸层可能还藏着
+
+    g_wp.wallpaper = true;
+    g_wp.dragging = false;
+    g_wp.rmbDown = false;
+    g_canvas->syncClientSize();
+    mateLog("[壁纸] 已挂到 %s（WorkerW 数=%d，图标层=%p）", structureName(L.structure),
+            countTopLevelWorkerW(), (void*)L.icons);
+    return true;
+}
+
+static void unmountWallpaper() {
+    if (!g_canvas) return;
+    HWND hwnd = g_canvas->hwnd();
+    if (!hwnd) return;
+
+    restoreWindowFromWallpaper(hwnd);
+    g_wp.wallpaper = false;
+    g_wp.dragging = false;
+    g_wp.rmbDown = false;
+    g_canvas->syncClientSize();
+    SetForegroundWindow(hwnd);   // 从桌面层回来时把窗口抬到前台，免得看着像"没反应"
+    mateLog("[壁纸] 已退回普通窗口");
+}
+
+/*==================== 壁纸交互：屏幕投影判断 ====================*/
+// 客户区坐标是否落在模型的投影圆内（屏幕坐标版本先 ScreenToClient 再调它）
+static bool interactRegionContainsClient(const POINT& c) {
+    if (!g_camera || !g_canvas) return false;
+    HWND hwnd = g_canvas->hwnd();
+    if (!hwnd) return false;
+
+    RECT rc = { 0, 0, 0, 0 };
+    GetClientRect(hwnd, &rc);
+    const float cw = (float)(rc.right - rc.left);
+    const float ch = (float)(rc.bottom - rc.top);
+    if (cw <= 1.0f || ch <= 1.0f) return false;
+
+    // 本版 Matrix4 没有 operator*，手动做齐次投影（elements 是列主序）
+    threepp::Matrix4 viewProj;
+    viewProj.multiplyMatrices(g_camera->projectionMatrix, g_camera->matrixWorldInverse);
+    const float* m = viewProj.elements.data();
+    const float x = g_interactCenter.x, y = g_interactCenter.y, z = g_interactCenter.z;
+    const float clipX = m[0] * x + m[4] * y + m[8]  * z + m[12];
+    const float clipY = m[1] * x + m[5] * y + m[9]  * z + m[13];
+    const float clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
+    if (clipW <= 0.0001f) return false;   // 在相机后面
+
+    const float sx = (clipX / clipW * 0.5f + 0.5f) * cw;
+    const float sy = (1.0f - (clipY / clipW * 0.5f + 0.5f)) * ch;
+
+    const float dist = g_controls ? g_controls->getDistance() : g_cameraBaseDistance;
+    const float halfFovTan = std::tan(threepp::math::degToRad(g_camera->fov * 0.5f));
+    const float pxPerUnit = (ch * 0.5f) / std::max(0.001f, dist * halfFovTan);
+    const float radiusPx = std::max(24.0f, g_interactRadius * pxPerUnit);
+
+    const float dx = (float)c.x - sx;
+    const float dy = (float)c.y - sy;
+    return dx * dx + dy * dy <= radiusPx * radiusPx;
+}
+
+// 返回屏幕点是否落在模型的投影圆内，同时输出窗口客户区坐标（给 OrbitControls 用）
+static bool cursorOverInteractRegion(const POINT& screenPt, float* outX, float* outY) {
+    if (!g_camera || !g_canvas) return false;
+    HWND hwnd = g_canvas->hwnd();
+    if (!hwnd) return false;
+
+    POINT c = screenPt;
+    ScreenToClient(hwnd, &c);
+
+    if (outX) *outX = (float)c.x;
+    if (outY) *outY = (float)c.y;
+    return interactRegionContainsClient(c);
+}
+
+// 普通窗口下的模型拖动：只在投影圆内按下左键时接管，其余事件仍给 OrbitControls
+static bool handleModelDrag(UINT msg, LPARAM lParam) {
+    if (!g_modelDragEnabled || !g_modelRoot || !g_camera || !g_canvas) return false;
+
+    const POINT pt{ (LONG)(short)LOWORD(lParam), (LONG)(short)HIWORD(lParam) };
+    switch (msg) {
+    case WM_LBUTTONDOWN:
+        if (!interactRegionContainsClient(pt)) return false;
+        g_modelDragging = true;
+        g_modelDragStart = pt;
+        g_modelDragOrigin.set(g_modelRoot->position.x, g_modelRoot->position.y,
+                              g_modelRoot->position.z);
+        return true;
+
+    case WM_MOUSEMOVE: {
+        if (!g_modelDragging) return false;
+        const float dxPx = (float)(pt.x - g_modelDragStart.x);
+        const float dyPx = (float)(pt.y - g_modelDragStart.y);
+
+        // 屏幕像素 → 世界单位：把模型所在的深度当画布，fx/fy 就是相机右/上方向
+        const float dist = g_controls ? g_controls->getDistance() : g_cameraBaseDistance;
+        const float halfFovTan = std::tan(threepp::math::degToRad(g_camera->fov * 0.5f));
+        const float pxPerUnit = (g_canvas->height() * 0.5f) / std::max(0.001f, dist * halfFovTan);
+
+        threepp::Vector3 dir, right, up;
+        g_camera->getWorldDirection(dir);
+        right.crossVectors(dir, threepp::Vector3(0.0f, 1.0f, 0.0f)).normalize();
+        up.crossVectors(right, dir).normalize();
+
+        threepp::Vector3 pos = g_modelDragOrigin
+                + right * (dxPx / pxPerUnit)
+                + up * (-dyPx / pxPerUnit);
+        g_modelRoot->position.set(pos.x, pos.y, pos.z);
+        g_interactCenter.set(pos.x, pos.y, pos.z);
+        g_modelAnchor.set(pos.x, pos.y, pos.z);
+        return true;
+    }
+
+    case WM_LBUTTONUP:
+        if (!g_modelDragging) return false;
+        g_modelDragging = false;
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+static LRESULT CALLBACK wallpaperMouseHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode != HC_ACTION || !g_wp.wallpaper || !g_wp.interactive || !g_canvas) {
+        return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+    }
+
+    const MSLLHOOKSTRUCT* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+    float cx = 0.0f, cy = 0.0f;
+    const bool over = cursorOverInteractRegion(ms->pt, &cx, &cy);
+
+    switch (wParam) {
+    case WM_MOUSEMOVE:
+        // 一旦在模型上按下，拖动期间即使移出投影圆也继续接收
+        if (g_wp.dragging || g_wp.rmbDown) {
+            g_canvas->feedMouseMove(cx, cy);
+            return 1;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        if (over) {
+            g_wp.dragging = true;
+            g_canvas->feedMouseMove(cx, cy);
+            g_canvas->feedMouseDown(0, cx, cy);
+            return 1;   // 吃掉，不让桌面图标被点到
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (g_wp.dragging) {
+            g_wp.dragging = false;
+            g_canvas->feedMouseUp(0, cx, cy);
+            return 1;
+        }
+        break;
+
+    case WM_RBUTTONDOWN:
+        if (over && !g_wp.dragging) {
+            g_wp.rmbDown = true;
+            g_canvas->feedMouseMove(cx, cy);
+            g_canvas->feedMouseDown(1, cx, cy);
+            return 1;
+        }
+        break;
+
+    case WM_RBUTTONUP:
+        if (g_wp.rmbDown) {
+            g_wp.rmbDown = false;
+            g_canvas->feedMouseUp(1, cx, cy);
+            return 1;
+        }
+        break;
+
+    case WM_MOUSEWHEEL:
+        if (over || g_wp.dragging || g_wp.rmbDown) {
+            const float dy = (float)((short)HIWORD(ms->mouseData)) / (float)WHEEL_DELTA;
+            g_canvas->feedMouseWheel(dy);
+            return 1;
+        }
+        break;
+
+    default:
+        break;
+    }
+    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+}
+
+static void setWallpaperMouseHook(bool on) {
+    if (on && !g_mouseHook) {
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, wallpaperMouseHook,
+                                        GetModuleHandleW(nullptr), 0);
+        if (!g_mouseHook) mateLog("[壁纸] 鼠标钩子安装失败: %lu\n", GetLastError());
+    } else if (!on && g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
+    }
+}
+
 int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK 代码页会把中文显示成乱码
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -785,14 +1334,15 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
     }
     timeBeginPeriod(1);
 
-    std::printf("========================================\n");
-    std::printf(" matex2 - threepp 11_texture2d 学习沙箱\n");
-    std::printf(" 左键旋转 / 右键平移 / 滚轮缩放 / ESC 退出\n");
-    std::printf("========================================\n");
+    mateLog("========================================\n");
+    mateLog(" matex2 - threepp 模型 / 动画 / 灯光 / 壁纸 学习沙箱\n");
+    mateLog(" 左键旋转 / 右键平移 / 滚轮缩放 / ESC 退出\n");
+    mateLog(" F5 壁纸 / F6 面板 / F8 交互 / F9 复位视角 / F12 退出\n");
+    mateLog("========================================\n");
 
     Win32Canvas canvas;
-    if (!canvas.create(L"Mate x2 - threepp 11_texture2d", kDefaultWidth, kDefaultHeight, true)) {
-        std::printf("[启动] 窗口/GL 初始化失败\n");
+    if (!canvas.create(L"Mate x2 - threepp 模型 / 视频", kDefaultWidth, kDefaultHeight, true)) {
+        mateLog("[启动] 窗口/GL 初始化失败\n");
         timeEndPeriod(1);
         return 1;
     }
@@ -802,7 +1352,7 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
         renderer = std::make_unique<threepp::GLRenderer>(
                 std::pair<int, int>{ canvas.width(), canvas.height() });
     } catch (const std::exception& e) {
-        std::printf("[threepp] 渲染器创建失败: %s\n", e.what());
+        mateLog("[threepp] 渲染器创建失败: %s\n", e.what());
         canvas.destroy();
         timeEndPeriod(1);
         return 1;
@@ -816,9 +1366,23 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
     imguiIo.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     imguiIo.IniFilename = nullptr;                 // 不生成 imgui.ini
     ImGui::StyleColorsDark();
+    // ChineseSimplifiedCommon 只含 2500 常用字，"频" / "帧" 这类面板必用的字不在其中，
+    // 会渲染成方块；把面板实际用到的字补进范围
+    static ImVector<ImWchar> glyphRanges;
+    {
+        ImFontGlyphRangesBuilder builder;
+        builder.AddRanges(imguiIo.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        builder.AddText("模型动画灯光视频音频播放该不含环境主补未打开灰色占位输出解码已解帧"
+                        "显示音量空间化听者源单位轨挂载壁纸桌面模式区域响应鼠标交互"
+                        "复位退出面板拖动左键位置秒日志清空共行到可用的层退化全屏置底"
+                        "普通窗口视角热键注册失败可能被其他程序占用错误场景只内置几何体"
+                        "加载目录个就位半径纹理尺寸率最慢线程正常结束切换"
+                        "缓冲欠载回调周期最大间隔后次累计");
+        builder.BuildRanges(&glyphRanges);
+    }
     if (std::filesystem::exists("C:/Windows/Fonts/msyh.ttc")) {
         imguiIo.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/msyh.ttc", 18.0f, nullptr,
-                                          imguiIo.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+                                          glyphRanges.Data);
     } else {
         imguiIo.Fonts->AddFontDefault();
     }
@@ -837,11 +1401,29 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
     try {
         controls = std::make_unique<threepp::OrbitControls>(*camera, canvas);
     } catch (const std::exception& e) {
-        std::printf("[相机] OrbitControls 创建失败: %s\n", e.what());
+        mateLog("[相机] OrbitControls 创建失败: %s\n", e.what());
         canvas.destroy();
         timeEndPeriod(1);
         return 1;
     }
+
+    // 壁纸钩子与交互判定要拿到相机/控件；模型换位时这两个全局量跟着更新
+    g_camera  = camera.get();
+    g_controls = controls.get();
+    g_cameraBaseDistance = camera->position.z;
+
+    // ---------- 灯光：glTF 的 PBR 材质没灯就是黑的，强度留给面板调 ----------
+    float ambientIntensity = 0.45f;
+    float keyIntensity     = 2.2f;
+    float fillIntensity    = 0.8f;
+    auto ambientLight = threepp::AmbientLight::create(0xffffff, ambientIntensity);
+    scene->add(ambientLight);
+    auto keyLight = threepp::DirectionalLight::create(0xffffff, keyIntensity);
+    keyLight->position.set(2.4f, 3.6f, 3.2f);
+    scene->add(keyLight);
+    auto fillLight = threepp::DirectionalLight::create(0x8899ff, fillIntensity);
+    fillLight->position.set(-3.0f, -1.5f, -2.0f);
+    scene->add(fillLight);
 
     std::filesystem::path texDir = exeDir() / "Data" / "textures";
     threepp::TextureLoader loader;
@@ -850,9 +1432,9 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
         checkerTex = loader.load(texDir / "checker.png", threepp::ColorSpace::sRGB);
         crateTex   = loader.load(texDir / "crate.gif", threepp::ColorSpace::sRGB);
         brickTex   = loader.load(texDir / "brick_bump.jpg", threepp::ColorSpace::sRGB);
-        std::printf("[纹理] checker.png / crate.gif / brick_bump.jpg 已加载\n");
+        mateLog("[纹理] checker.png / crate.gif / brick_bump.jpg 已加载\n");
     } catch (const std::exception& e) {
-        std::printf("[纹理] 加载失败: %s（检查 %s）\n", e.what(), texDir.string().c_str());
+        mateLog("[纹理] 加载失败: %s（检查 %s）\n", e.what(), texDir.string().c_str());
         canvas.destroy();
         timeEndPeriod(1);
         return 1;
@@ -887,9 +1469,9 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
     std::shared_ptr<threepp::Texture> levTex;
     try {
         levTex = loader.load(std::filesystem::path("E:/MX/Data/lev.jpg"), threepp::ColorSpace::sRGB);
-        std::printf("[纹理] lev.jpg 已加载\n");
+        mateLog("[纹理] lev.jpg 已加载\n");
     } catch (const std::exception& e) {
-        std::printf("[纹理] lev.jpg 加载失败: %s\n", e.what());
+        mateLog("[纹理] lev.jpg 加载失败: %s\n", e.what());
         canvas.destroy();
         timeEndPeriod(1);
         return 1;
@@ -946,7 +1528,7 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
         audio3d.setVolume(audioVolume);
         audio3d.setSpatialized(audioSpatial);
     } else {
-        std::printf("[音频] 引擎初始化失败：%s（本次静音）\n", audio3d.error());
+        mateLog("[音频] 引擎初始化失败：%s（本次静音）\n", audio3d.error());
     }
 
     // 三个 R8 平面纹理（Y 全尺寸，U/V 各 1/2），上传量只有 RGBA 的 3/8
@@ -977,9 +1559,9 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
             videoPlanes[p]->image().data<unsigned char>()[0] = 128;   // 灰占位
         }
         if (!video.open(path, videoMode, videoWidth)) {
-            std::printf("[视频] %s 打开失败，视频面回退成 YUV 占位\n", path.c_str());
+            mateLog("[视频] %s 打开失败，视频面回退成 YUV 占位\n", path.c_str());
         } else {
-            std::printf("[视频] %s 已打开，输出 %dx%d（%s），模式=%s\n", path.c_str(),
+            mateLog("[视频] %s 已打开，输出 %dx%d（%s），模式=%s\n", path.c_str(),
                         video.width(), video.height(),
                         video.isYuv() ? "YUV420P" : "RGBA",
                         videoMode == mate::VideoSource::Mode::Sync ? "同步" : "独立线程");
@@ -987,7 +1569,9 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
                 videoPlanes[p] = makePlaneTex(video.planeWidth(p), video.planeHeight(p));
             }
             if (!audio3d.attach(video)) {
-                std::printf("[音频] 挂载音轨失败：%s\n", audio3d.error());
+                mateLog("[音频] 挂载音轨失败：%s\n", audio3d.error());
+            } else {
+                mateLog("[音频] 已挂载（后端 %s）", audio3d.backendName());
             }
         }
         faceVideo->uniforms["yTex"] = threepp::Uniform(videoPlanes[0].get());
@@ -1023,12 +1607,119 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
     reflector->position.set(0.0f, -2.5f, 0.0f);
     scene->add(reflector);
 
+    /* ---------------- 模型 + 动画 ---------------- */
+    const std::filesystem::path modelDir = resolveModelDir();
+    std::vector<ModelEntry> models = scanModels(modelDir);
+    mateLog("[模型] 目录 %s，共 %d 个\n", modelDir.string().c_str(), (int)models.size());
+
+    std::shared_ptr<threepp::Group> modelRoot;
+    std::unique_ptr<threepp::AnimationMixer> modelMixer;
+    std::vector<std::shared_ptr<threepp::AnimationClip>> modelClips;
+    int  modelIndex = 0;
+    int  clipIndex  = 0;
+    bool animPlaying = false;
+
+    // 摆位点默认在视野正中（g_modelAnchor，面板可开关左键拖动来调整）
+    // 换片段/开关播放都走这里：先停掉全部 action，再按当前状态重挂
+    auto applyClip = [&] {
+        if (!modelMixer) return;
+        modelMixer->stopAllAction();
+        if (clipIndex < 0 || clipIndex >= (int)modelClips.size() || !animPlaying) return;
+        if (auto* action = modelMixer->clipAction(modelClips[clipIndex])) {
+            action->setLoop(threepp::Loop::Repeat, -1);
+            action->reset().play();
+        }
+    };
+
+    // 加载第 index 个模型：先加载成功再卸旧的，加载失败时旧模型留在场景里
+    auto applyModel = [&](int index) {
+        if (index < 0 || index >= (int)models.size()) return;
+        const ModelEntry& entry = models[index];
+        mateLog("[模型] 加载 %d/%d：%s\n", index + 1, (int)models.size(),
+                    entry.label.c_str());
+
+        threepp::GLTFLoader gltf;
+        auto result = gltf.load(entry.path);
+        if (!result || !result->scene) {
+            mateLog("[模型] 加载失败：%s\n", entry.label.c_str());
+            return;
+        }
+
+        // mixer 持有旧根节点引用，必须先拆再释放模型
+        modelMixer.reset();
+        modelClips.clear();
+        g_modelRoot = nullptr;   // 拖动逻辑在此之前不能再碰旧节点
+        if (modelRoot) modelRoot->removeFromParent();
+        modelRoot.reset();
+
+        modelRoot = result->scene;
+
+        // 按包围盒把最大边缩到约 2.2，并把包围盒中心摆到 g_modelAnchor
+        threepp::Box3 bounds;
+        bounds.setFromObject(*modelRoot);
+        float radius = 1.0f;
+        if (!bounds.isEmpty()) {
+            const threepp::Vector3 center = bounds.getCenter();
+            const threepp::Vector3 size   = bounds.getSize();
+            const float maxEdge = std::max({ size.x, size.y, size.z });
+            const float scale   = maxEdge > 1e-4f ? 2.2f / maxEdge : 1.0f;
+            modelRoot->scale.set(scale, scale, scale);
+            modelRoot->position.set(g_modelAnchor.x - center.x * scale,
+                                    g_modelAnchor.y - center.y * scale,
+                                    g_modelAnchor.z - center.z * scale);
+            radius = 0.5f * maxEdge * scale;
+        } else {
+            modelRoot->position.set(g_modelAnchor.x, g_modelAnchor.y, g_modelAnchor.z);
+        }
+        g_interactCenter.set(g_modelAnchor.x, g_modelAnchor.y, g_modelAnchor.z);
+        g_interactRadius = std::max(0.4f, radius);
+        scene->add(modelRoot);
+        g_modelRoot = modelRoot.get();
+        modelIndex = index;
+
+        modelClips  = result->animations;
+        clipIndex   = 0;
+        animPlaying = !modelClips.empty();
+        if (animPlaying) {
+            modelMixer = std::make_unique<threepp::AnimationMixer>(*modelRoot);
+            applyClip();
+            std::string names;
+            for (size_t i = 0; i < modelClips.size(); ++i) {
+                if (i) names += " / ";
+                names += modelClips[i]->name();
+            }
+            mateLog("[动画] 共 %d 段：%s\n", (int)modelClips.size(), names.c_str());
+        } else {
+            mateLog("[动画] 该模型不含动画\n");
+        }
+        mateLog("[模型] 已就位：%s（交互半径 %.2f）\n", entry.label.c_str(),
+                    g_interactRadius);
+    };
+
+    // 拖动后一键回正中（只挪模型位置，不动相机）
+    auto resetModelPosition = [&] {
+        const threepp::Vector3 target(0.0f, 0.25f, 1.2f);
+        const threepp::Vector3 delta = target - g_interactCenter;
+        if (modelRoot) {
+            const threepp::Vector3 p = modelRoot->position + delta;
+            modelRoot->position.set(p.x, p.y, p.z);
+        }
+        g_interactCenter.set(target.x, target.y, target.z);
+        g_modelAnchor.set(target.x, target.y, target.z);
+    };
+
+    if (!models.empty()) {
+        applyModel(0);
+    } else {
+        mateLog("[模型] 目录里没有 .glb / .gltf，场景只有内置几何体\n");
+    }
+
     canvas.onWindowResize([&](threepp::WindowSize size) {
         camera->aspect = size.aspect();
         camera->updateProjectionMatrix();
         renderer->setSize(std::pair<int, int>{ size.width(), size.height() });
         glViewport(0, 0, size.width(), size.height());
-        std::printf("[窗口] 尺寸 %dx%d\n", size.width(), size.height());
+        mateLog("[窗口] 尺寸 %dx%d\n", size.width(), size.height());
     });
 
     auto last = std::chrono::steady_clock::now();
@@ -1036,7 +1727,29 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
     int    fpsFrames = 0;
     float  fpsWorstDt = 0.0f;   // 一个统计窗口里最慢的一帧（衡量卡顿，比平均 fps 更真实）
 
-    while (canvas.pumpEvents()) {
+    while (canvas.pumpEvents() && !g_wp.wantQuit) {
+        // 热键请求统一在主循环消费：SetParent / 盖钩子这些重活不能放在 WndProc 里做
+        if (g_wp.wantToggle) {
+            g_wp.wantToggle = false;
+            if (g_wp.wallpaper) {
+                setWallpaperMouseHook(false);
+                unmountWallpaper();
+            } else if (mountWallpaper()) {
+                setWallpaperMouseHook(true);   // 挂上了才开全局鼠标钩子
+            }
+        }
+        if (g_wp.wantRemount) {
+            g_wp.wantRemount = false;
+            if (g_wp.wallpaper) mountWallpaper();   // 换分辨率/Explorer 重启后重挂
+        }
+        if (g_wp.wantResetView) {
+            g_wp.wantResetView = false;
+            camera->position.set(0.0f, 0.0f, g_cameraBaseDistance);
+            controls->target.set(0.0f, 0.0f, 0.0f);
+            controls->update();
+            mateLog("[壁纸] 视角已复位\n");
+        }
+
         const auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - last).count();
         last = now;
@@ -1044,6 +1757,9 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
 
         box->rotation.y += 0.5f * dt;
         sphere->rotation.x += 0.5f * dt;
+
+        // glTF 自带动画：时间轴按真实帧间隔推进，暂停时不动
+        if (animPlaying && modelMixer) modelMixer->update(dt);
 
         controls->update();
 
@@ -1074,44 +1790,127 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
         fxPlaneMaterial->uniforms["map"] = threepp::Uniform(fxCanvas.texture());
         fxPlaneMaterial->uniformsNeedUpdate = true;
 
-        // ImGui 面板：切换立方体上的测试视频
+        // ImGui 面板：模型 / 动画 / 灯光 / 视频 / 音频 / 壁纸
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_FirstUseEver);
-        ImGui::Begin("matex2 视频 / 音频");
-        for (int i = 0; i < (int)videoPaths.size(); ++i) {
-            if (ImGui::RadioButton(videoPaths[i].c_str(), videoIndex == i) && videoIndex != i) {
-                videoIndex = i;
-                applyVideo(videoIndex);
+        // 壁纸模式下窗口已经是桌面的一部分，面板没有意义，直接跳过
+        if (!g_wp.wallpaper && g_wp.showPanel) {
+            ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_FirstUseEver);
+            ImGui::Begin("matex2 模型 / 视频 / 音频");
+            ImGui::Text("模型：%d 个（%s）", (int)models.size(), modelDir.string().c_str());
+            if (!models.empty()) {
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::BeginCombo("##model", models[modelIndex].label.c_str())) {
+                    for (int i = 0; i < (int)models.size(); ++i) {
+                        const bool selected = (i == modelIndex);
+                        if (ImGui::Selectable(models[i].label.c_str(), selected)) applyModel(i);
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
             }
+            if (!modelClips.empty()) {
+                char preview[192];
+                std::snprintf(preview, sizeof(preview), "%s（%.1f s）",
+                              modelClips[clipIndex]->name().c_str(),
+                              modelClips[clipIndex]->getDuration());
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::BeginCombo("##clip", preview)) {
+                    for (int i = 0; i < (int)modelClips.size(); ++i) {
+                        char item[192];
+                        std::snprintf(item, sizeof(item), "%s（%.1f s）",
+                                      modelClips[i]->name().c_str(),
+                                      modelClips[i]->getDuration());
+                        if (ImGui::Selectable(item, clipIndex == i)) {
+                            clipIndex = i;
+                            applyClip();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (ImGui::Checkbox("播放动画", &animPlaying)) applyClip();
+            } else {
+                ImGui::TextDisabled("该模型不含动画");
+            }
+            ImGui::Checkbox("拖动模型（左键按住模型）", &g_modelDragEnabled);
+            if (ImGui::Button("模型居中")) resetModelPosition();
+
+            ImGui::Separator();
+            ImGui::Text("灯光");
+            if (ImGui::SliderFloat("环境光", &ambientIntensity, 0.0f, 2.0f, "%.2f"))
+                ambientLight->intensity = ambientIntensity;
+            if (ImGui::SliderFloat("主光", &keyIntensity, 0.0f, 5.0f, "%.2f"))
+                keyLight->intensity = keyIntensity;
+            if (ImGui::SliderFloat("补光", &fillIntensity, 0.0f, 5.0f, "%.2f"))
+                fillLight->intensity = fillIntensity;
+
+            ImGui::Separator();
+            for (int i = 0; i < (int)videoPaths.size(); ++i) {
+                if (ImGui::RadioButton(videoPaths[i].c_str(), videoIndex == i) && videoIndex != i) {
+                    videoIndex = i;
+                    applyVideo(videoIndex);
+                }
+            }
+            ImGui::Separator();
+            if (video.isOpen()) {
+                const mate::VideoSource::Stats vs = video.stats();
+                ImGui::Text("输出 %dx%d  %s", video.width(), video.height(),
+                            video.isYuv() ? "YUV420P" : "RGBA");
+                ImGui::Text("解码 %.2f ms  已解 %d 帧 / 已显示 %d 帧",
+                            vs.decodeMs, vs.decoded, vs.presented);
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "视频未打开（灰色占位）");
+            }
+            ImGui::Separator();
+            ImGui::Text("音频（miniaudio 3D，%s）", audio3d.backendName());
+            if (ImGui::SliderFloat("音量", &audioVolume, 0.0f, 1.0f, "%.2f")) {
+                audio3d.setVolume(audioVolume);
+            }
+            if (ImGui::Checkbox("3D 空间化", &audioSpatial)) {
+                audio3d.setSpatialized(audioSpatial);
+            }
+            if (audio3d.active()) {
+                ImGui::Text("听者—音源 %.2f 单位", audio3d.distance());
+                ImGui::Text("缓冲 %.2f s  欠载 %.0f ms", audio3d.bufferedSeconds(),
+                            audio3d.underrunSeconds() * 1000.0);
+                ImGui::Text("回调 周期 %.1f  最大 %.1f ms", audio3d.callbackPeriodMs(),
+                            audio3d.callbackGapMaxMs());
+                ImGui::Text("回调拖后 %llu 次", audio3d.callbackLateCount());
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "音轨未挂载%s%s",
+                                   audio3d.error()[0] ? "：" : "", audio3d.error());
+            }
+
+            ImGui::Separator();
+            ImGui::Text("壁纸");
+            bool wallpaperOn = g_wp.wallpaper;
+            if (ImGui::Checkbox("桌面壁纸模式（F5）", &wallpaperOn)) g_wp.wantToggle = true;
+            ImGui::Checkbox("模型区域响应鼠标（F8）", &g_wp.interactive);
+            ImGui::Checkbox("显示日志窗口", &g_showLog);
+            ImGui::TextDisabled("F5 壁纸 / F6 面板 / F8 交互 / F9 复位 / F12 退出");
+            ImGui::End();
         }
-        ImGui::Separator();
-        if (video.isOpen()) {
-            const mate::VideoSource::Stats vs = video.stats();
-            ImGui::Text("输出 %dx%d  %s", video.width(), video.height(),
-                        video.isYuv() ? "YUV420P" : "RGBA");
-            ImGui::Text("解码 %.2f ms  已解 %d 帧 / 已显示 %d 帧",
-                        vs.decodeMs, vs.decoded, vs.presented);
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "视频未打开（灰色占位）");
+
+        // 日志窗口：控制台已经去掉，mateLog 写的都在这看
+        if (!g_wp.wallpaper && g_showLog) {
+            ImGui::SetNextWindowPos(ImVec2((float)canvas.width() - 452.0f, 12.0f),
+                                    ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(440.0f, 300.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("matex2 日志", &g_showLog)) {
+                if (ImGui::Button("清空")) g_logLines.clear();
+                ImGui::SameLine();
+                ImGui::TextDisabled("共 %d 行", (int)g_logLines.size());
+                ImGui::Separator();
+                ImGui::BeginChild("##loglines", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+                const bool atBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
+                for (const auto& line : g_logLines) ImGui::TextUnformatted(line.c_str());
+                if (atBottom) ImGui::SetScrollHereY(1.0f);   // 只在贴底时自动跟到最新
+                ImGui::EndChild();
+            }
+            ImGui::End();
         }
-        ImGui::Separator();
-        ImGui::Text("音频（miniaudio 3D）");
-        if (ImGui::SliderFloat("音量", &audioVolume, 0.0f, 1.0f, "%.2f")) {
-            audio3d.setVolume(audioVolume);
-        }
-        if (ImGui::Checkbox("3D 空间化", &audioSpatial)) {
-            audio3d.setSpatialized(audioSpatial);
-        }
-        if (audio3d.active()) {
-            ImGui::Text("听者—音源 %.2f 单位", audio3d.distance());
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "音轨未挂载%s%s",
-                               audio3d.error()[0] ? "：" : "", audio3d.error());
-        }
-        ImGui::End();
         ImGui::Render();
 
         renderer->clear();
@@ -1124,15 +1923,33 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
         if (dt > fpsWorstDt) fpsWorstDt = dt;
         if (fpsTimer >= 2.0) {
             const mate::VideoSource::Stats vs = video.stats();
-            std::printf("[帧率] %.1f fps（%dx%d）最慢帧 %.2f ms  视频 %dx%d 解码 %.1f ms / 已解 %d 帧 / 已显示 %d 帧\n",
+            mateLog("[帧率] %.1f fps（%dx%d）最慢帧 %.2f ms  视频 %dx%d 解码 %.1f ms / 已解 %d 帧 / 已显示 %d 帧\n",
                         fpsFrames / fpsTimer, canvas.width(), canvas.height(),
                         fpsWorstDt * 1000.0f, video.width(), video.height(),
                         vs.decodeMs, vs.decoded, vs.presented);
+            if (audio3d.active()) {
+                static double s_lastUnderrunMs = 0.0;
+                const double underMs = audio3d.underrunSeconds() * 1000.0;
+                mateLog("[音频] 缓冲 %.2f s  欠载 +%.0f ms（累计 %.0f）",
+                        audio3d.bufferedSeconds(), underMs - s_lastUnderrunMs, underMs);
+                s_lastUnderrunMs = underMs;
+                mateLog("[音频] 回调 周期 %.1f  最大 %.1f ms  拖后 %llu 次",
+                        audio3d.callbackPeriodMs(), audio3d.callbackGapMaxMs(),
+                        audio3d.callbackLateCount());
+            }
             fpsTimer = 0.0;
             fpsFrames = 0;
             fpsWorstDt = 0.0f;
         }
     }
+
+    // 先摘鼠标钩子、退出壁纸层，再拆音频/纹理
+    setWallpaperMouseHook(false);
+    if (g_wp.wallpaper) unmountWallpaper();
+    if (modelMixer) modelMixer->stopAllAction();
+    modelMixer.reset();   // mixer 持有模型根节点引用，先拆
+    g_modelRoot = nullptr;
+    modelRoot.reset();
 
     audio3d.shutdown();   // 先停音频，再拆视频/纹理
 
@@ -1142,6 +1959,6 @@ int main() {    // 源码字符串是 UTF-8（/utf-8），控制台默认 GBK �
 
     canvas.destroy();
     timeEndPeriod(1);
-    std::printf("[退出] matex2 正常结束\n");
+    mateLog("[退出] matex2 正常结束\n");
     return 0;
 }
